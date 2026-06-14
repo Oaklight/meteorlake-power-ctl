@@ -13,7 +13,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import logging
@@ -96,7 +96,7 @@ PROFILES: dict[str, Profile] = {
         name="power-saver",
         tlp_cmd="power-saver",
         smt=False,
-        park_pcores=4,
+        park_pcores=5,
         park_ecores=4,
         refresh_hz=60,
         lpmd=LpmdParams(util_entry_threshold=20, entry_hyst_ms=1500),

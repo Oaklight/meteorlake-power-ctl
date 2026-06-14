@@ -1,6 +1,6 @@
 [project]
 name = "mtl-power-ctl"
-version = "0.1.0"
+version = "0.2.0"
 description = "Power profile manager for Intel Meteor Lake laptops"
 authors = [{ name = "Pding", email = "pding@oaklight.cn" }]
 readme = "README.md"
