@@ -17,7 +17,9 @@ Tested on ThinkPad X1 Carbon Gen 12 (Core Ultra 7 155H) with Arch Linux.
 ### From AUR
 
 ```bash
-yay -S mtl-power-ctl
+# Using any AUR helper, e.g.:
+paru -S mtl-power-ctl
+# or: yay -S mtl-power-ctl
 ```
 
 ### Manual
