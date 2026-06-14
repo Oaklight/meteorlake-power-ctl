@@ -61,7 +61,8 @@ class Profile:
     tlp_cmd: str  # tlp subcommand to activate this profile
     smt: bool
     lpmd: LpmdParams
-    park_pcores: bool  # offline P-cores (except CPU 0) for max power saving
+    park_pcores: int  # number of P-cores to park (0 = all online)
+    park_ecores: int  # number of E-cores to park (0 = all online)
     refresh_hz: int  # eDP refresh rate (120 or 60)
     # For display / notification
     icon: str
@@ -73,7 +74,8 @@ PROFILES: dict[str, Profile] = {
         name="performance",
         tlp_cmd="ac",
         smt=True,
-        park_pcores=False,
+        park_pcores=0,
+        park_ecores=0,
         refresh_hz=120,
         lpmd=LpmdParams(util_entry_threshold=10, entry_hyst_ms=3000),
         icon="power-profile-performance-symbolic",
@@ -83,21 +85,23 @@ PROFILES: dict[str, Profile] = {
         name="balanced",
         tlp_cmd="bat",
         smt=False,
-        park_pcores=False,
+        park_pcores=0,
+        park_ecores=0,
         refresh_hz=60,
         lpmd=LpmdParams(util_entry_threshold=10, entry_hyst_ms=3000),
         icon="power-profile-balanced-symbolic",
-        description="Turbo off, SMT off, 60Hz",
+        description="Turbo on (max 80%), SMT off, 60Hz",
     ),
     "power-saver": Profile(
         name="power-saver",
         tlp_cmd="power-saver",
         smt=False,
-        park_pcores=True,
+        park_pcores=4,
+        park_ecores=4,
         refresh_hz=60,
         lpmd=LpmdParams(util_entry_threshold=20, entry_hyst_ms=1500),
         icon="power-profile-power-saver-symbolic",
-        description="Max saving, P-cores parked, E-core only, 60Hz",
+        description="2P + 4E + 2LP, turbo off, 60Hz",
     ),
 }
 
@@ -320,10 +324,12 @@ def apply_lpmd(profile: Profile) -> None:
     )
 
 
-def _get_pcore_cpus() -> list[int]:
-    """Detect P-core logical CPU IDs (excluding CPU 0 which can't be offlined).
+def _classify_cpus() -> tuple[list[int], list[int], list[int]]:
+    """Classify online CPUs into P-cores, E-cores, and LP E-cores.
 
-    P-cores are identified by having max frequency > E-core max frequency.
+    Returns (pcores, ecores, lp_ecores) as sorted lists of CPU IDs.
+    CPU 0 is excluded from P-cores (can't be offlined).
+    Classification is by max frequency tiers.
     """
     freqs: dict[int, int] = {}
     cpu_dir = Path("/sys/devices/system/cpu")
@@ -337,46 +343,84 @@ def _get_pcore_cpus() -> list[int]:
                 continue
 
     if not freqs:
-        return []
+        return [], [], []
 
-    max_freq = max(freqs.values())
-    return sorted(cpu for cpu, freq in freqs.items() if freq == max_freq and cpu != 0)
+    # Sort unique freq tiers descending: highest = P-core, middle = E-core, lowest = LP
+    tiers = sorted(set(freqs.values()), reverse=True)
+    tier_map = {}
+    for i, freq in enumerate(tiers):
+        if i == 0:
+            tier_map[freq] = "P"
+        elif i == len(tiers) - 1 and len(tiers) >= 3:
+            tier_map[freq] = "LP"
+        else:
+            tier_map[freq] = "E"
+
+    pcores = sorted(c for c, f in freqs.items() if tier_map[f] == "P" and c != 0)
+    ecores = sorted(c for c, f in freqs.items() if tier_map[f] == "E")
+    lp_ecores = sorted(c for c, f in freqs.items() if tier_map[f] == "LP")
+
+    return pcores, ecores, lp_ecores
 
 
-def apply_pcores(profile: Profile) -> None:
-    """Park or unpark P-cores (except CPU 0)."""
-    if not profile.park_pcores:
-        cpu_dir = Path("/sys/devices/system/cpu")
-        for cpupath in sorted(cpu_dir.glob("cpu[0-9]*")):
-            online_path = cpupath / "online"
-            if online_path.exists():
-                try:
-                    if online_path.read_text().strip() == "0":
-                        online_path.write_text("1")
-                except OSError:
-                    pass
-        logger.info("All CPUs unparked")
-        return
+def _unpark_all() -> None:
+    """Bring all offline CPUs back online."""
+    cpu_dir = Path("/sys/devices/system/cpu")
+    for cpupath in sorted(cpu_dir.glob("cpu[0-9]*")):
+        online_path = cpupath / "online"
+        if online_path.exists():
+            try:
+                if online_path.read_text().strip() == "0":
+                    online_path.write_text("1")
+            except OSError:
+                pass
+    logger.info("All CPUs unparked")
 
-    pcore_cpus = _get_pcore_cpus()
-    if not pcore_cpus:
-        return
-    for cpu_id in pcore_cpus:
+
+def _park_cpus(cpu_ids: list[int]) -> None:
+    """Offline specific CPUs."""
+    for cpu_id in cpu_ids:
         online_path = Path(f"/sys/devices/system/cpu/cpu{cpu_id}/online")
         try:
             online_path.write_text("0")
         except OSError as e:
             logger.warning("Failed to park cpu%d: %s", cpu_id, e)
-    logger.info("P-cores parked: %s", pcore_cpus)
+
+
+def apply_parking(profile: Profile) -> None:
+    """Park or unpark CPUs according to profile.
+
+    Always unparks everything first (so classification works on full topology),
+    then parks the requested number of P-cores and E-cores.
+    """
+    # Step 1: always unpark all first
+    _unpark_all()
+
+    if profile.park_pcores == 0 and profile.park_ecores == 0:
+        return
+
+    # Step 2: classify with full topology online
+    pcores, ecores, _lp = _classify_cpus()
+
+    # Park from the end of each list (keep lower-numbered CPUs)
+    to_park: list[int] = []
+    if profile.park_pcores > 0 and pcores:
+        n = min(profile.park_pcores, len(pcores))
+        to_park.extend(pcores[-n:])
+    if profile.park_ecores > 0 and ecores:
+        n = min(profile.park_ecores, len(ecores))
+        to_park.extend(ecores[-n:])
+
+    if to_park:
+        _park_cpus(to_park)
+        logger.info("Parked CPUs: %s", sorted(to_park))
 
 
 def apply_profile(profile: Profile, *, notify_user: bool = True) -> None:
     """Apply all aspects of a power profile."""
-    if not profile.park_pcores:
-        apply_pcores(profile)
+    # Unpark + reclassify + selectively park (handles SMT siblings correctly)
+    apply_parking(profile)
     apply_smt(profile)
-    if profile.park_pcores:
-        apply_pcores(profile)
     apply_tlp(profile)
     apply_lpmd(profile)
     apply_refresh(profile)
