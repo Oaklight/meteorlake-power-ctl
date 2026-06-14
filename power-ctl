@@ -325,42 +325,61 @@ def apply_lpmd(profile: Profile) -> None:
 
 
 def _classify_cpus() -> tuple[list[int], list[int], list[int]]:
-    """Classify online CPUs into P-cores, E-cores, and LP E-cores.
+    """Classify CPUs into P-cores, E-cores, and LP E-cores.
 
     Returns (pcores, ecores, lp_ecores) as sorted lists of CPU IDs.
     CPU 0 is excluded from P-cores (can't be offlined).
-    Classification is by max frequency tiers.
+
+    Classification uses topology (SMT siblings) and base_frequency:
+    - P-core: has SMT sibling (thread_siblings_list contains comma/dash)
+    - E-core vs LP E-core: distinguished by base_frequency
     """
-    freqs: dict[int, int] = {}
     cpu_dir = Path("/sys/devices/system/cpu")
-    for cpupath in cpu_dir.glob("cpu[0-9]*"):
+    pcores: list[int] = []
+    ecores_all: dict[int, int] = {}  # cpu_id → base_freq
+
+    for cpupath in sorted(cpu_dir.glob("cpu[0-9]*")):
         cpu_id = int(cpupath.name.removeprefix("cpu"))
-        max_freq_path = cpupath / "cpufreq" / "cpuinfo_max_freq"
-        if max_freq_path.exists():
-            try:
-                freqs[cpu_id] = int(max_freq_path.read_text().strip())
-            except (OSError, ValueError):
-                continue
+        siblings_path = cpupath / "topology" / "thread_siblings_list"
+        base_freq_path = cpupath / "cpufreq" / "base_frequency"
 
-    if not freqs:
-        return [], [], []
+        if not siblings_path.exists():
+            continue
 
-    # Sort unique freq tiers descending: highest = P-core, middle = E-core, lowest = LP
-    tiers = sorted(set(freqs.values()), reverse=True)
-    tier_map = {}
-    for i, freq in enumerate(tiers):
-        if i == 0:
-            tier_map[freq] = "P"
-        elif i == len(tiers) - 1 and len(tiers) >= 3:
-            tier_map[freq] = "LP"
+        try:
+            siblings = siblings_path.read_text().strip()
+        except OSError:
+            continue
+
+        # P-core: has SMT sibling (siblings list contains comma or dash = multi-thread)
+        has_smt = "," in siblings or "-" in siblings
+        if has_smt:
+            if cpu_id != 0:
+                pcores.append(cpu_id)
         else:
-            tier_map[freq] = "E"
+            # E-core or LP E-core — read base_frequency to distinguish
+            base_freq = 0
+            if base_freq_path.exists():
+                try:
+                    base_freq = int(base_freq_path.read_text().strip())
+                except (OSError, ValueError):
+                    pass
+            ecores_all[cpu_id] = base_freq
 
-    pcores = sorted(c for c, f in freqs.items() if tier_map[f] == "P" and c != 0)
-    ecores = sorted(c for c, f in freqs.items() if tier_map[f] == "E")
-    lp_ecores = sorted(c for c, f in freqs.items() if tier_map[f] == "LP")
+    # Split E-cores into regular and LP by base_frequency
+    # LP E-cores have the lowest base frequency tier
+    ecores: list[int] = []
+    lp_ecores: list[int] = []
 
-    return pcores, ecores, lp_ecores
+    if ecores_all:
+        min_freq = min(ecores_all.values())
+        for cpu_id, freq in sorted(ecores_all.items()):
+            if freq == min_freq:
+                lp_ecores.append(cpu_id)
+            else:
+                ecores.append(cpu_id)
+
+    return sorted(pcores), ecores, lp_ecores
 
 
 def _unpark_all() -> None:
@@ -387,13 +406,59 @@ def _park_cpus(cpu_ids: list[int]) -> None:
             logger.warning("Failed to park cpu%d: %s", cpu_id, e)
 
 
+def _get_physical_cores(cpu_ids: list[int]) -> list[list[int]]:
+    """Group CPU IDs by physical core (using thread_siblings_list).
+
+    Returns a list of groups, each group is a list of sibling CPU IDs.
+    Groups are sorted by lowest CPU ID in each group.
+    """
+    seen: set[int] = set()
+    groups: list[list[int]] = []
+    cpu_dir = Path("/sys/devices/system/cpu")
+
+    for cpu_id in sorted(cpu_ids):
+        if cpu_id in seen:
+            continue
+        siblings_path = cpu_dir / f"cpu{cpu_id}" / "topology" / "thread_siblings_list"
+        if not siblings_path.exists():
+            groups.append([cpu_id])
+            seen.add(cpu_id)
+            continue
+        try:
+            siblings_str = siblings_path.read_text().strip()
+        except OSError:
+            groups.append([cpu_id])
+            seen.add(cpu_id)
+            continue
+
+        # Parse "0,5" or "1-2" format
+        sibling_ids: list[int] = []
+        for part in siblings_str.split(","):
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                sibling_ids.extend(range(int(lo), int(hi) + 1))
+            else:
+                sibling_ids.append(int(part))
+
+        # Only include siblings that are in our cpu_ids list
+        group = sorted(s for s in sibling_ids if s in set(cpu_ids))
+        for s in group:
+            seen.add(s)
+        if group:
+            groups.append(group)
+
+    return groups
+
+
 def apply_parking(profile: Profile) -> None:
     """Park or unpark CPUs according to profile.
 
     Always unparks everything first (so classification works on full topology),
-    then parks the requested number of P-cores and E-cores.
+    then parks the requested number of physical P-cores and E-cores.
+    park_pcores=4 means park 4 physical P-cores (= 8 threads if SMT on).
     """
-    # Step 1: always unpark all first
+    # Step 1: always unpark all + enable SMT (so we see full topology)
+    SMT_CONTROL.write_text("on")
     _unpark_all()
 
     if profile.park_pcores == 0 and profile.park_ecores == 0:
@@ -402,14 +467,23 @@ def apply_parking(profile: Profile) -> None:
     # Step 2: classify with full topology online
     pcores, ecores, _lp = _classify_cpus()
 
-    # Park from the end of each list (keep lower-numbered CPUs)
+    # Step 3: group P-cores by physical core
+    pcore_groups = _get_physical_cores(pcores)
+    ecore_groups = _get_physical_cores(ecores)  # E-cores have no siblings, 1 per group
+
     to_park: list[int] = []
-    if profile.park_pcores > 0 and pcores:
-        n = min(profile.park_pcores, len(pcores))
-        to_park.extend(pcores[-n:])
-    if profile.park_ecores > 0 and ecores:
-        n = min(profile.park_ecores, len(ecores))
-        to_park.extend(ecores[-n:])
+
+    # Park N physical P-cores from the end
+    if profile.park_pcores > 0 and pcore_groups:
+        n = min(profile.park_pcores, len(pcore_groups))
+        for group in pcore_groups[-n:]:
+            to_park.extend(group)
+
+    # Park N E-cores from the end
+    if profile.park_ecores > 0 and ecore_groups:
+        n = min(profile.park_ecores, len(ecore_groups))
+        for group in ecore_groups[-n:]:
+            to_park.extend(group)
 
     if to_park:
         _park_cpus(to_park)
@@ -418,8 +492,9 @@ def apply_parking(profile: Profile) -> None:
 
 def apply_profile(profile: Profile, *, notify_user: bool = True) -> None:
     """Apply all aspects of a power profile."""
-    # Unpark + reclassify + selectively park (handles SMT siblings correctly)
+    # Parking unparks all + enables SMT first, then parks selected cores
     apply_parking(profile)
+    # SMT off after parking (so parked sibling threads also go offline)
     apply_smt(profile)
     apply_tlp(profile)
     apply_lpmd(profile)
