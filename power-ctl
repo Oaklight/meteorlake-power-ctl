@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""power-ctl — Unified power profile manager for Intel Meteor Lake laptops.
+
+Atomically switches TLP profile, SMT, intel-lpmd thresholds, P-core parking,
+and display refresh rate across three power profiles.
+
+Usage:
+    power-ctl toggle              # Cycle: performance → balanced → power-saver → ...
+    power-ctl toggle <profile>    # Set a specific profile directly
+    power-ctl status              # Show current profile, SMT, battery, display
+    power-ctl install             # Deploy TLP config and create symlink
+"""
+
+from __future__ import annotations
+
+__version__ = "0.1.0"
+
+import argparse
+import logging
+import os
+import pwd
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from xml.etree import ElementTree as ET
+
+logger = logging.getLogger("power-ctl")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+LPMD_DIR = Path("/etc/intel_lpmd")
+LPMD_LIVE = LPMD_DIR / "intel_lpmd_config_F6_M170.xml"
+TLP_CONF_DEST = Path("/etc/tlp.d/90-mtl-power-ctl.conf")
+TLP_CONF_SRC = Path(__file__).resolve().parent / "config" / "90-mtl-power-ctl.conf"
+SMT_CONTROL = Path("/sys/devices/system/cpu/smt/control")
+SCRIPT_PATH = Path(__file__).resolve()
+
+# ---------------------------------------------------------------------------
+# Profile definitions
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LpmdParams:
+    """Intel LPMD threshold parameters."""
+
+    util_entry_threshold: int
+    util_exit_threshold: int = 95
+    entry_hyst_ms: int = 3000
+    exit_hyst_ms: int = 1000
+
+
+@dataclass(frozen=True)
+class Profile:
+    """A power profile combining TLP, SMT, and LPMD settings."""
+
+    name: str
+    tlp_cmd: str  # tlp subcommand to activate this profile
+    smt: bool
+    lpmd: LpmdParams
+    park_pcores: bool  # offline P-cores (except CPU 0) for max power saving
+    refresh_hz: int  # eDP refresh rate (120 or 60)
+    # For display / notification
+    icon: str
+    description: str
+
+
+PROFILES: dict[str, Profile] = {
+    "performance": Profile(
+        name="performance",
+        tlp_cmd="ac",
+        smt=True,
+        park_pcores=False,
+        refresh_hz=120,
+        lpmd=LpmdParams(util_entry_threshold=10, entry_hyst_ms=3000),
+        icon="power-profile-performance-symbolic",
+        description="Full performance, SMT on, turbo on, 120Hz",
+    ),
+    "balanced": Profile(
+        name="balanced",
+        tlp_cmd="bat",
+        smt=False,
+        park_pcores=False,
+        refresh_hz=60,
+        lpmd=LpmdParams(util_entry_threshold=10, entry_hyst_ms=3000),
+        icon="power-profile-balanced-symbolic",
+        description="Turbo off, SMT off, 60Hz",
+    ),
+    "power-saver": Profile(
+        name="power-saver",
+        tlp_cmd="power-saver",
+        smt=False,
+        park_pcores=True,
+        refresh_hz=60,
+        lpmd=LpmdParams(util_entry_threshold=20, entry_hyst_ms=1500),
+        icon="power-profile-power-saver-symbolic",
+        description="Max saving, P-cores parked, E-core only, 60Hz",
+    ),
+}
+
+CYCLE_ORDER = ["performance", "balanced", "power-saver"]
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    """Run a command, log it, return result."""
+    logger.debug("Running: %s", " ".join(cmd))
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def _read(path: str, fallback: str = "?") -> str:
+    """Read a sysfs/procfs file, return fallback on error."""
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return fallback
+
+
+def _color(text: str, code: int) -> str:
+    """Wrap text in ANSI color if stdout is a terminal."""
+    if not sys.stdout.isatty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _get_desktop_user() -> tuple[str, str]:
+    """Return (username, uid) of the real desktop user.
+
+    When running under sudo, returns the original user.
+    Otherwise falls back to the current user.
+    """
+    user = os.environ.get("SUDO_USER")
+    uid = os.environ.get("SUDO_UID")
+    if user and uid:
+        return user, uid
+    # Not under sudo — use current user
+    pw = pwd.getpwuid(os.getuid())
+    return pw.pw_name, str(pw.pw_uid)
+
+
+def is_ac_online() -> bool:
+    """Check if any power supply reports online (AC connected)."""
+    ps_dir = Path("/sys/class/power_supply")
+    for supply in ps_dir.iterdir():
+        online = supply / "online"
+        if online.is_file():
+            try:
+                if online.read_text().strip() == "1":
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def get_current_tlp_profile() -> str:
+    """Get current TLP profile name (performance|balanced|power-saver)."""
+    result = run(["tlp-stat", "-s"], check=False)
+    for line in result.stdout.splitlines():
+        if "TLP profile" in line:
+            value = line.split("=", 1)[1].strip()
+            return value.split("/")[0].strip()
+    return "unknown"
+
+
+def notify(title: str, message: str, icon: str = "") -> None:
+    """Send a desktop notification (best-effort, never fails)."""
+    cmd = ["notify-send", "-t", "2000"]
+    if icon:
+        cmd += ["-i", icon]
+    cmd += [title, message]
+
+    user, uid = _get_desktop_user()
+    env_vars = {
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{uid}/bus",
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+    }
+
+    try:
+        if os.geteuid() == 0:
+            subprocess.run(
+                [
+                    "runuser",
+                    "-u",
+                    user,
+                    "--",
+                    "env",
+                    *(f"{k}={v}" for k, v in env_vars.items()),
+                    *cmd,
+                ],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            subprocess.run(
+                cmd,
+                env={**os.environ, **env_vars},
+                capture_output=True,
+                check=False,
+            )
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Profile application
+# ---------------------------------------------------------------------------
+
+
+def apply_tlp(profile: Profile) -> None:
+    """Switch TLP to the given profile."""
+    run(["tlp", profile.tlp_cmd], check=False)
+    logger.info("TLP switched to %s (tlp %s)", profile.name, profile.tlp_cmd)
+
+
+def apply_smt(profile: Profile) -> None:
+    """Enable or disable SMT."""
+    state = "on" if profile.smt else "off"
+    try:
+        SMT_CONTROL.write_text(state)
+        logger.info("SMT set to %s", state)
+    except OSError as e:
+        logger.warning("Failed to set SMT: %s", e)
+
+
+def _find_niri_socket() -> str | None:
+    """Find the niri IPC socket path."""
+    sock = os.environ.get("NIRI_SOCKET")
+    if sock and Path(sock).exists():
+        return sock
+    _user, uid = _get_desktop_user()
+    runtime_dir = Path(f"/run/user/{uid}")
+    for p in runtime_dir.glob("niri.*.sock"):
+        return str(p)
+    return None
+
+
+def apply_refresh(profile: Profile) -> None:
+    """Set eDP panel refresh rate via niri."""
+    mode = f"2880x1800@{profile.refresh_hz}.000"
+    user, uid = _get_desktop_user()
+
+    niri_sock = _find_niri_socket()
+    if not niri_sock:
+        logger.warning("niri socket not found, skipping refresh rate change")
+        return
+
+    result = subprocess.run(
+        [
+            "runuser",
+            "-u",
+            user,
+            "--",
+            "env",
+            f"XDG_RUNTIME_DIR=/run/user/{uid}",
+            f"NIRI_SOCKET={niri_sock}",
+            "niri",
+            "msg",
+            "output",
+            "eDP-1",
+            "mode",
+            mode,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        logger.info("Display refresh set to %dHz", profile.refresh_hz)
+    else:
+        logger.warning("Failed to set refresh rate: %s", result.stderr.strip())
+
+
+def apply_lpmd(profile: Profile) -> None:
+    """Write LPMD config and restart the daemon."""
+    if not LPMD_LIVE.parent.is_dir():
+        logger.warning("LPMD config directory not found, skipping")
+        return
+
+    params = profile.lpmd
+    root = ET.Element("Configuration")
+    fields = {
+        "lp_mode_cpus": "",
+        "Mode": "0",
+        "PerformanceDef": "-1",
+        "BalancedDef": "0",
+        "PowersaverDef": "0",
+        "HfiLpmEnable": "1",
+        "WLTHintEnable": "1",
+        "WLTProxyEnable": "0",
+        "HfiSuvEnable": "1",
+        "util_entry_threshold": str(params.util_entry_threshold),
+        "util_exit_threshold": str(params.util_exit_threshold),
+        "EntryDelayMS": "0",
+        "ExitDelayMS": "0",
+        "EntryHystMS": str(params.entry_hyst_ms),
+        "ExitHystMS": str(params.exit_hyst_ms),
+        "IgnoreITMT": "0",
+        "lp_mode_epp": "-1",
+    }
+    for tag, text in fields.items():
+        el = ET.SubElement(root, tag)
+        el.text = text
+
+    ET.indent(ET.ElementTree(root), space="    ")
+    LPMD_LIVE.write_text(
+        '<?xml version="1.0"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
+    )
+
+    run(["systemctl", "restart", "intel_lpmd.service"], check=False)
+    logger.info(
+        "LPMD config updated (entry=%d%%, hyst=%dms) and restarted",
+        params.util_entry_threshold,
+        params.entry_hyst_ms,
+    )
+
+
+def _get_pcore_cpus() -> list[int]:
+    """Detect P-core logical CPU IDs (excluding CPU 0 which can't be offlined).
+
+    P-cores are identified by having max frequency > E-core max frequency.
+    """
+    freqs: dict[int, int] = {}
+    cpu_dir = Path("/sys/devices/system/cpu")
+    for cpupath in cpu_dir.glob("cpu[0-9]*"):
+        cpu_id = int(cpupath.name.removeprefix("cpu"))
+        max_freq_path = cpupath / "cpufreq" / "cpuinfo_max_freq"
+        if max_freq_path.exists():
+            try:
+                freqs[cpu_id] = int(max_freq_path.read_text().strip())
+            except (OSError, ValueError):
+                continue
+
+    if not freqs:
+        return []
+
+    max_freq = max(freqs.values())
+    return sorted(cpu for cpu, freq in freqs.items() if freq == max_freq and cpu != 0)
+
+
+def apply_pcores(profile: Profile) -> None:
+    """Park or unpark P-cores (except CPU 0)."""
+    if not profile.park_pcores:
+        cpu_dir = Path("/sys/devices/system/cpu")
+        for cpupath in sorted(cpu_dir.glob("cpu[0-9]*")):
+            online_path = cpupath / "online"
+            if online_path.exists():
+                try:
+                    if online_path.read_text().strip() == "0":
+                        online_path.write_text("1")
+                except OSError:
+                    pass
+        logger.info("All CPUs unparked")
+        return
+
+    pcore_cpus = _get_pcore_cpus()
+    if not pcore_cpus:
+        return
+    for cpu_id in pcore_cpus:
+        online_path = Path(f"/sys/devices/system/cpu/cpu{cpu_id}/online")
+        try:
+            online_path.write_text("0")
+        except OSError as e:
+            logger.warning("Failed to park cpu%d: %s", cpu_id, e)
+    logger.info("P-cores parked: %s", pcore_cpus)
+
+
+def apply_profile(profile: Profile, *, notify_user: bool = True) -> None:
+    """Apply all aspects of a power profile."""
+    if not profile.park_pcores:
+        apply_pcores(profile)
+    apply_smt(profile)
+    if profile.park_pcores:
+        apply_pcores(profile)
+    apply_tlp(profile)
+    apply_lpmd(profile)
+    apply_refresh(profile)
+    logger.info("Profile %s applied", profile.name)
+    if notify_user:
+        notify("Power Profile", f"Switched to: {profile.name}", profile.icon)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_toggle(target: str | None = None) -> None:
+    """Set a specific profile, or cycle if none given."""
+    if target:
+        if target not in PROFILES:
+            print(f"Unknown profile: {target}", file=sys.stderr)
+            print(f"Available: {', '.join(PROFILES)}", file=sys.stderr)
+            sys.exit(1)
+        apply_profile(PROFILES[target])
+        return
+
+    current = get_current_tlp_profile()
+    try:
+        idx = CYCLE_ORDER.index(current)
+        next_name = CYCLE_ORDER[(idx + 1) % len(CYCLE_ORDER)]
+    except ValueError:
+        next_name = "balanced"
+
+    apply_profile(PROFILES[next_name])
+
+
+def cmd_status() -> None:
+    """Show current power state with color formatting."""
+    current = get_current_tlp_profile()
+    ac = is_ac_online()
+
+    profile_colors = {
+        "performance": 32,
+        "balanced": 33,
+        "power-saver": 36,
+    }
+    profile_icons = {
+        "performance": "\U0001f680",
+        "balanced": "⚖️ ",
+        "power-saver": "\U0001f50b",
+    }
+    color = profile_colors.get(current, 37)
+    icon = profile_icons.get(current, "❓")
+
+    # Battery
+    bat_pct = bat_rate = bat_status = "?"
+    for bat_dir in Path("/sys/class/power_supply").iterdir():
+        if (bat_dir / "type").is_file():
+            if (bat_dir / "type").read_text().strip() == "Battery":
+                bat_pct = _read(str(bat_dir / "capacity"))
+                bat_status = _read(str(bat_dir / "status"))
+                power_now = bat_dir / "power_now"
+                if power_now.is_file():
+                    bat_rate = f"{int(power_now.read_text().strip()) / 1_000_000:.1f}W"
+                break
+
+    # Time to empty/full
+    bat_time = ""
+    result = run(["upower", "--dump"], check=False)
+    for line in result.stdout.splitlines():
+        if "time to empty" in line or "time to full" in line:
+            bat_time = line.split(":", 1)[1].strip()
+            break
+
+    # CPU details
+    platform = _read("/sys/firmware/acpi/platform_profile")
+    epp = _read("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
+    turbo = (
+        "off" if _read("/sys/devices/system/cpu/intel_pstate/no_turbo") == "1" else "on"
+    )
+    smt = "on" if _read("/sys/devices/system/cpu/smt/active") == "1" else "off"
+    online = _read("/sys/devices/system/cpu/online")
+
+    # Temperature
+    temp = "?"
+    for tz in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
+        tz_type = _read(str(tz / "type"))
+        if tz_type in ("x86_pkg_temp", "acpitz"):
+            raw = _read(str(tz / "temp"))
+            if raw != "?":
+                temp = f"{int(raw) // 1000}°C"
+            break
+
+    # Display refresh rate
+    refresh = "?"
+    result = run(["niri", "msg", "outputs"], check=False)
+    for line in result.stdout.splitlines():
+        if "Current mode" in line:
+            parts = line.split("@")
+            if len(parts) > 1:
+                refresh = parts[1].strip().split(".")[0] + "Hz"
+            break
+
+    # Brightness
+    bright_pct = "?"
+    for bl_dir in Path("/sys/class/backlight").iterdir():
+        b = _read(str(bl_dir / "brightness"))
+        bmax = _read(str(bl_dir / "max_brightness"))
+        if b != "?" and bmax != "?":
+            bright_pct = f"{int(b) * 100 // int(bmax)}%"
+        break
+
+    # Output
+    sep = _color("─" * 44, 90)
+    print(sep)
+    print(f" {icon} {_color(current.upper(), color)} ")
+    print(sep)
+
+    source = _color("AC ⚡", 32) if ac else _color("Battery \U0001f50b", 33)
+    print(f"  Power:     {source}  {bat_pct}%  {bat_rate}")
+    if bat_time:
+        label = "remaining" if bat_status == "Discharging" else "to full"
+        print(f"             {bat_time} {label}")
+    print()
+
+    print(f"  Platform:  {platform}")
+    print(f"  EPP:       {epp}")
+    print(f"  Turbo:     {turbo}    SMT: {smt}    Temp: {temp}")
+    print(f"  CPUs:      {online}")
+    print()
+
+    print(f"  Display:   {refresh}  brightness {bright_pct}")
+    print(sep)
+
+
+def cmd_install() -> None:
+    """Deploy TLP config and create symlink."""
+    print("Installing power-ctl configuration...")
+
+    # TLP config
+    if TLP_CONF_SRC.is_file():
+        import shutil
+
+        shutil.copy2(TLP_CONF_SRC, TLP_CONF_DEST)
+        print(f"  ✓ {TLP_CONF_DEST}")
+    else:
+        print(f"  ✗ TLP config source not found: {TLP_CONF_SRC}", file=sys.stderr)
+
+    # Symlink
+    system_bin = Path("/usr/local/bin/power-ctl")
+    system_bin.unlink(missing_ok=True)
+    system_bin.symlink_to(SCRIPT_PATH)
+    print(f"  ✓ {system_bin} → {SCRIPT_PATH}")
+
+    # Apply
+    run(["tlp", "start"], check=False)
+
+    print("\nInstallation complete.")
+    print("  Toggle profiles:  sudo power-ctl toggle [profile]")
+    print("  Check status:     power-ctl status")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable debug logging"
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Unified power profile manager for Intel Meteor Lake laptops",
+        parents=[common],
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    toggle_p = sub.add_parser(
+        "toggle",
+        help="Cycle profiles, or set one directly: toggle [profile]",
+        parents=[common],
+    )
+    toggle_p.add_argument(
+        "profile",
+        nargs="?",
+        choices=PROFILES.keys(),
+        default=None,
+        help="Target profile (omit to cycle)",
+    )
+    sub.add_parser("status", help="Show current power state", parents=[common])
+    sub.add_parser(
+        "install", help="Deploy TLP config and create symlink", parents=[common]
+    )
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(name)s: %(message)s",
+    )
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command != "status" and os.geteuid() != 0:
+        print("Error: must run as root (use sudo)", file=sys.stderr)
+        sys.exit(1)
+
+    match args.command:
+        case "toggle":
+            cmd_toggle(args.profile)
+        case "status":
+            cmd_status()
+        case "install":
+            cmd_install()
+
+
+if __name__ == "__main__":
+    main()
