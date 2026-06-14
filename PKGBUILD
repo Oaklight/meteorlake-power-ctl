@@ -12,7 +12,7 @@ optdepends=(
 	'niri: display refresh rate switching via IPC'
 )
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('ba73f41eb30de482dd83f648f71dfd846f9da9ac9a595d5d8851ed0df40359e1')
 backup=('etc/tlp.d/90-mtl-power-ctl.conf')
 
 package() {
