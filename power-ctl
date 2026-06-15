@@ -530,23 +530,33 @@ def cmd_toggle(target: str | None = None) -> None:
 
 
 def cmd_on_ac() -> None:
-    """Hook: called when AC power is connected. Restore performance profile."""
+    """Hook: called when AC power is connected.
+
+    Only auto-switch if currently on the default balanced (battery) profile.
+    If user manually selected power-saver or performance, don't override.
+    """
     if not is_ac_online():
         return
-    apply_profile(PROFILES["performance"])
+    current = get_current_tlp_profile()
+    if current == "balanced":
+        apply_profile(PROFILES["performance"])
+    else:
+        logger.info("Keeping manual profile %s on AC plug", current)
 
 
 def cmd_on_battery() -> None:
-    """Hook: called when AC power is disconnected. Switch to balanced."""
+    """Hook: called when AC power is disconnected.
+
+    Only auto-switch if currently on the default performance (AC) profile.
+    If user manually selected power-saver or balanced, don't override.
+    """
     if is_ac_online():
         return
     current = get_current_tlp_profile()
-    # Don't upgrade if user manually set power-saver
-    if current == "power-saver":
-        # Just ensure SMT is off (it should be already)
-        apply_smt(PROFILES["power-saver"])
-        return
-    apply_profile(PROFILES["balanced"])
+    if current == "performance":
+        apply_profile(PROFILES["balanced"])
+    else:
+        logger.info("Keeping manual profile %s on AC unplug", current)
 
 
 def cmd_status() -> None:
