@@ -6,11 +6,11 @@ Tested on ThinkPad X1 Carbon Gen 12 (Core Ultra 7 155H) with Arch Linux.
 
 ## Profiles
 
-| Profile | Turbo | SMT | P-cores | Hz | EPP | Platform | Typical PkgWatt |
-|---------|-------|-----|---------|-----|-----|----------|-----------------|
-| **performance** | on | on (22T) | all | 120 | balance_performance | balanced | ~8W |
-| **balanced** | off | off (16T) | all | 60 | balance_power | balanced | ~5W |
-| **power-saver** | off | off (11T) | parked | 60 | power | low-power | ~3.7W |
+| Profile | Turbo | SMT | Cores | Hz | EPP | Platform | PkgWatt |
+|---------|-------|-----|-------|-----|-----|----------|---------|
+| **performance** | on | on | 6Px2+8E+2LP (22T) | 120 | balance_performance | balanced | ~8W |
+| **balanced** | on 80% | off | 6P+8E+2LP (16T) | 60 | balance_power | balanced | ~5W |
+| **power-saver** | off | off | 2P+4E+2LP (8T) | 60 | power | low-power | ~3.7W |
 
 ## Install
 
@@ -28,6 +28,7 @@ paru -S mtl-power-ctl
 git clone https://github.com/oaklight/meteorlake-power-ctl.git
 cd meteorlake-power-ctl
 sudo make install
+sudo power-ctl install   # deploy udev hooks for auto AC/battery switching
 ```
 
 ## Usage
@@ -48,11 +49,48 @@ power-ctl status
 power-ctl --version
 ```
 
+### Automatic AC/battery switching
+
+After `sudo power-ctl install`, udev rules and systemd services are deployed:
+
+- **Plug AC** → automatically switches to `performance` (all cores, SMT on, 120Hz)
+- **Unplug AC** → automatically switches to `balanced` (SMT off, 60Hz)
+- If you manually selected `power-saver`, unplugging AC will **not** override it
+
+The mechanism is:
+
+```
+udev power_supply event
+  → systemd starts power-ctl-on-{ac,battery}.service (async, non-blocking)
+    → power-ctl on-ac / power-ctl on-battery
+```
+
+Using `TAG+="systemd"` + `SYSTEMD_WANTS` instead of udev `RUN` because power-ctl needs time to unpark CPUs, restart lpmd, and switch display refresh rate — udev `RUN` has a short timeout and blocks the event queue.
+
 ### Keybinding (niri example)
 
 ```kdl
 // In ~/.config/niri/config.kdl
-Mod+B { spawn "sudo" "power-ctl" "toggle"; }
+
+// Interactive profile selector popup
+Mod+B { spawn "kitty" "--class" "power-selector" "--title" "Power Profile"
+    "-o" "remember_window_size=no" "-o" "initial_window_width=52c"
+    "-o" "initial_window_height=12c" "-o" "confirm_os_window_close=0"
+    "/path/to/power-profile-selector"; }
+
+// Quick status popup
+Mod+Shift+B { spawn "kitty" "--class" "power-status" "--title" "Power Status"
+    "-o" "remember_window_size=no" "-o" "initial_window_width=52c"
+    "-o" "initial_window_height=14c" "-o" "confirm_os_window_close=0"
+    "sh" "-c" "power-ctl status; echo; read -n1"; }
+
+// Float the popup windows
+window-rule {
+    match app-id="power-selector"
+    match app-id="power-status"
+    open-floating true
+    open-focused true
+}
 ```
 
 For passwordless sudo, add to `/etc/sudoers.d/power-ctl`:
@@ -77,12 +115,13 @@ youruser ALL=(ALL) NOPASSWD: /usr/bin/power-ctl
 
 Each profile applies settings atomically in the correct order:
 
-1. **Unpark CPUs** (if switching away from power-saver)
-2. **SMT** — enable/disable HyperThreading at runtime
-3. **Park P-cores** (if entering power-saver) — offline P-cores except CPU 0
-4. **TLP** — switch EPP, turbo, platform profile, GPU, WiFi power save
-5. **intel-lpmd** — write tuned thresholds and restart daemon
-6. **Display** — switch eDP refresh rate via niri IPC
+1. **Unpark all CPUs** + enable SMT (so topology detection works on full core set)
+2. **Classify CPUs** — P-core (has SMT sibling), E-core, LP E-core (by base_frequency)
+3. **Park selected cores** — power-saver parks 5 physical P-cores + 4 E-cores
+4. **Disable SMT** (balanced/power-saver) — parked siblings also go offline
+5. **TLP** — switch EPP, turbo, platform profile, GPU, WiFi power save
+6. **intel-lpmd** — write per-profile thresholds and restart daemon
+7. **Display** — switch eDP refresh rate via niri IPC (120Hz / 60Hz)
 
 ### Why park P-cores?
 
@@ -90,13 +129,17 @@ On Meteor Lake, P-cores have high leakage current even in C6 idle state. The 155
 
 ### Why disable SMT on battery?
 
-HyperThreading prevents P-cores from entering deep C-states (C6) because both sibling threads must be idle simultaneously. Disabling SMT simplifies the scheduler topology and improves C-state residency. Intel removed HT from Arrow Lake and Lunar Lake for similar reasons.
+HyperThreading prevents P-cores from entering deep C-states (C6) because both sibling threads must be idle simultaneously. Disabling SMT simplifies the scheduler topology from P×2+E+LP to P+E+LP and improves C-state residency. Intel removed HT from Arrow Lake and Lunar Lake for similar reasons.
+
+### Why not use max_perf_pct to limit frequency?
+
+With turbo off, `max_perf_pct` is relative to base frequency (1.4GHz on 155H P-cores), so 80% = 1.12GHz — too slow for interactive use. Instead, balanced keeps turbo on but caps at 80% of turbo max (~3.6GHz), giving burst capability without sustained high power draw.
 
 ## Meteor Lake C-state notes
 
 - Core C-state path: C1E → C6 → C10 (no C3/C7/C8/C9)
 - Package C-state path: PC2 → PC6 → PC8 → PC10 (no PC3)
-- **PC6+ is only reachable during s2idle suspend**, not during normal idle. Pkg%pc6=0 is architectural, not a bug.
+- **PC6+ is only reachable during s2idle suspend**, not during normal idle. `Pkg%pc6=0` is architectural, not a bug.
 - S0ix is boot-dependent due to CSME firmware initialization differences.
 
 ## License
