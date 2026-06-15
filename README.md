@@ -53,9 +53,9 @@ power-ctl --version
 
 After `sudo power-ctl install`, udev rules and systemd services are deployed:
 
-- **Plug AC** → automatically switches to `performance` (all cores, SMT on, 120Hz)
-- **Unplug AC** → automatically switches to `balanced` (SMT off, 60Hz)
-- If you manually selected `power-saver`, unplugging AC will **not** override it
+- **Plug AC** → switches to `performance` (only if currently on `balanced`)
+- **Unplug AC** → switches to `balanced` (only if currently on `performance`)
+- **Manual selections are never overridden** — if you chose `power-saver` or manually set `balanced` on AC, plug/unplug events won't change it
 
 The mechanism is:
 
