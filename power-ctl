@@ -529,6 +529,26 @@ def cmd_toggle(target: str | None = None) -> None:
     apply_profile(PROFILES[next_name])
 
 
+def cmd_on_ac() -> None:
+    """Hook: called when AC power is connected. Restore performance profile."""
+    if not is_ac_online():
+        return
+    apply_profile(PROFILES["performance"])
+
+
+def cmd_on_battery() -> None:
+    """Hook: called when AC power is disconnected. Switch to balanced."""
+    if is_ac_online():
+        return
+    current = get_current_tlp_profile()
+    # Don't upgrade if user manually set power-saver
+    if current == "power-saver":
+        # Just ensure SMT is off (it should be already)
+        apply_smt(PROFILES["power-saver"])
+        return
+    apply_profile(PROFILES["balanced"])
+
+
 def cmd_status() -> None:
     """Show current power state with color formatting."""
     current = get_current_tlp_profile()
@@ -629,25 +649,63 @@ def cmd_status() -> None:
 
 
 def cmd_install() -> None:
-    """Deploy TLP config and create symlink."""
+    """Deploy TLP config, symlink, udev rules, and systemd units."""
+    import shutil
+    import textwrap
+
     print("Installing power-ctl configuration...")
+    script = SCRIPT_PATH
+    udev_dir = Path("/etc/udev/rules.d")
+    systemd_dir = Path("/etc/systemd/system")
 
     # TLP config
     if TLP_CONF_SRC.is_file():
-        import shutil
-
         shutil.copy2(TLP_CONF_SRC, TLP_CONF_DEST)
         print(f"  ✓ {TLP_CONF_DEST}")
-    else:
-        print(f"  ✗ TLP config source not found: {TLP_CONF_SRC}", file=sys.stderr)
 
     # Symlink
     system_bin = Path("/usr/local/bin/power-ctl")
     system_bin.unlink(missing_ok=True)
-    system_bin.symlink_to(SCRIPT_PATH)
-    print(f"  ✓ {system_bin} → {SCRIPT_PATH}")
+    system_bin.symlink_to(script)
+    print(f"  ✓ {system_bin} → {script}")
 
-    # Apply
+    # udev rules
+    (udev_dir / "99-power-ctl-ac.rules").write_text(
+        'SUBSYSTEM=="power_supply", ATTR{online}=="1", '
+        'TAG+="systemd", ENV{SYSTEMD_WANTS}+="power-ctl-on-ac.service"\n'
+    )
+    (udev_dir / "99-power-ctl-battery.rules").write_text(
+        'SUBSYSTEM=="power_supply", ATTR{online}=="0", '
+        'TAG+="systemd", ENV{SYSTEMD_WANTS}+="power-ctl-on-battery.service"\n'
+    )
+    print("  ✓ udev rules")
+
+    # systemd units
+    (systemd_dir / "power-ctl-on-ac.service").write_text(
+        textwrap.dedent(f"""\
+        [Unit]
+        Description=power-ctl: restore performance on AC plug
+        ConditionACPower=true
+
+        [Service]
+        Type=oneshot
+        ExecStart={script} on-ac
+        """)
+    )
+    (systemd_dir / "power-ctl-on-battery.service").write_text(
+        textwrap.dedent(f"""\
+        [Unit]
+        Description=power-ctl: switch to balanced on battery
+
+        [Service]
+        Type=oneshot
+        ExecStart={script} on-battery
+        """)
+    )
+    print("  ✓ systemd units")
+
+    run(["systemctl", "daemon-reload"])
+    run(["udevadm", "control", "--reload-rules"])
     run(["tlp", "start"], check=False)
 
     print("\nInstallation complete.")
@@ -688,8 +746,10 @@ def main() -> None:
         help="Target profile (omit to cycle)",
     )
     sub.add_parser("status", help="Show current power state", parents=[common])
+    sub.add_parser("on-ac", help="Hook: AC plugged in", parents=[common])
+    sub.add_parser("on-battery", help="Hook: AC unplugged", parents=[common])
     sub.add_parser(
-        "install", help="Deploy TLP config and create symlink", parents=[common]
+        "install", help="Deploy TLP config, symlink, and udev hooks", parents=[common]
     )
 
     args = parser.parse_args()
@@ -712,6 +772,10 @@ def main() -> None:
             cmd_toggle(args.profile)
         case "status":
             cmd_status()
+        case "on-ac":
+            cmd_on_ac()
+        case "on-battery":
+            cmd_on_battery()
         case "install":
             cmd_install()
 
