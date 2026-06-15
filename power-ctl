@@ -64,9 +64,12 @@ class Profile:
     park_pcores: int  # number of P-cores to park (0 = all online)
     park_ecores: int  # number of E-cores to park (0 = all online)
     refresh_hz: int  # eDP refresh rate (120 or 60)
+    # Optional overrides applied after TLP (for modes TLP can't express)
+    platform_override: str | None = None  # override platform_profile
+    epp_override: str | None = None  # override EPP
     # For display / notification
-    icon: str
-    description: str
+    icon: str = ""
+    description: str = ""
 
 
 PROFILES: dict[str, Profile] = {
@@ -101,7 +104,20 @@ PROFILES: dict[str, Profile] = {
         refresh_hz=60,
         lpmd=LpmdParams(util_entry_threshold=20, entry_hyst_ms=1500),
         icon="power-profile-power-saver-symbolic",
-        description="2P + 4E + 2LP, turbo off, 60Hz",
+        description="2P+4E+2LP, turbo off, 60Hz",
+    ),
+    "boost": Profile(
+        name="boost",
+        tlp_cmd="ac",
+        smt=True,
+        park_pcores=0,
+        park_ecores=0,
+        refresh_hz=120,
+        lpmd=LpmdParams(util_entry_threshold=10, entry_hyst_ms=3000),
+        platform_override="performance",
+        epp_override="performance",
+        icon="power-profile-performance-symbolic",
+        description="Max power, EPP perf, fan full, 120Hz",
     ),
 }
 
@@ -163,13 +179,27 @@ def is_ac_online() -> bool:
 
 
 def get_current_tlp_profile() -> str:
-    """Get current TLP profile name (performance|balanced|power-saver)."""
+    """Get current power-ctl profile name.
+
+    TLP can't distinguish boost from performance (both use AC params),
+    so we check platform_profile to detect boost mode.
+    """
     result = run(["tlp-stat", "-s"], check=False)
+    tlp_name = "unknown"
     for line in result.stdout.splitlines():
         if "TLP profile" in line:
             value = line.split("=", 1)[1].strip()
-            return value.split("/")[0].strip()
-    return "unknown"
+            tlp_name = value.split("/")[0].strip()
+            break
+
+    # Detect boost: TLP says "performance" but platform_profile is "performance"
+    # (normal performance profile sets platform_profile to "balanced")
+    if tlp_name == "performance":
+        pp = _read("/sys/firmware/acpi/platform_profile")
+        if pp == "performance":
+            return "boost"
+
+    return tlp_name
 
 
 def notify(title: str, message: str, icon: str = "") -> None:
@@ -497,11 +527,29 @@ def apply_profile(profile: Profile, *, notify_user: bool = True) -> None:
     # SMT off after parking (so parked sibling threads also go offline)
     apply_smt(profile)
     apply_tlp(profile)
+    # Apply overrides after TLP (for modes TLP can't express)
+    if profile.platform_override:
+        pp = Path("/sys/firmware/acpi/platform_profile")
+        try:
+            pp.write_text(profile.platform_override)
+            logger.info("Platform profile overridden to %s", profile.platform_override)
+        except OSError as e:
+            logger.warning("Failed to override platform profile: %s", e)
+    if profile.epp_override:
+        for epp_path in Path("/sys/devices/system/cpu").glob(
+            "cpu*/cpufreq/energy_performance_preference"
+        ):
+            try:
+                epp_path.write_text(profile.epp_override)
+            except OSError:
+                pass
+        logger.info("EPP overridden to %s", profile.epp_override)
     apply_lpmd(profile)
     apply_refresh(profile)
     logger.info("Profile %s applied", profile.name)
     if notify_user:
-        notify("Power Profile", f"Switched to: {profile.name}", profile.icon)
+        source = "AC" if is_ac_online() else "Battery"
+        notify("Power Profile", f"{profile.name} ({source})", profile.icon)
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +581,7 @@ def cmd_on_ac() -> None:
     """Hook: called when AC power is connected.
 
     Only auto-switch if currently on the default balanced (battery) profile.
-    If user manually selected power-saver or performance, don't override.
+    Any manual selection (power-saver, boost, etc.) is preserved.
     """
     if not is_ac_online():
         return
@@ -548,7 +596,7 @@ def cmd_on_battery() -> None:
     """Hook: called when AC power is disconnected.
 
     Only auto-switch if currently on the default performance (AC) profile.
-    If user manually selected power-saver or balanced, don't override.
+    Any manual selection (power-saver, boost, balanced) is preserved.
     """
     if is_ac_online():
         return
@@ -565,11 +613,13 @@ def cmd_status() -> None:
     ac = is_ac_online()
 
     profile_colors = {
+        "boost": 31,
         "performance": 32,
         "balanced": 33,
         "power-saver": 36,
     }
     profile_icons = {
+        "boost": "\U0001f525",
         "performance": "\U0001f680",
         "balanced": "⚖️ ",
         "power-saver": "\U0001f50b",
