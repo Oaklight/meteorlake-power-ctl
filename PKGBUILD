@@ -1,6 +1,6 @@
 # Maintainer: Pding <pding@oaklight.cn>
 pkgname=mtl-power-ctl
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Power profile manager for Intel Meteor Lake laptops (TLP + LPMD + SMT + P-core parking)"
 arch=('any')

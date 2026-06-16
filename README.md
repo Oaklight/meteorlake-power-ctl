@@ -8,9 +8,12 @@ Tested on ThinkPad X1 Carbon Gen 12 (Core Ultra 7 155H) with Arch Linux.
 
 | Profile | Turbo | SMT | Cores | Hz | EPP | Platform | PkgWatt |
 |---------|-------|-----|-------|-----|-----|----------|---------|
+| **boost** | on | on | 6Px2+8E+2LP (22T) | 120 | performance | performance | ~12W |
 | **performance** | on | on | 6Px2+8E+2LP (22T) | 120 | balance_performance | balanced | ~8W |
 | **balanced** | on 80% | off | 6P+8E+2LP (16T) | 60 | balance_power | balanced | ~5W |
 | **power-saver** | off | off | 2P+4E+2LP (8T) | 60 | power | low-power | ~3.7W |
+
+**boost** is for short bursts (compilation, benchmarks) — fans run at maximum, CPU unconstrained. Not in the auto AC/battery cycle; must be selected manually.
 
 ## Install
 
@@ -55,7 +58,9 @@ After `sudo power-ctl install`, udev rules and systemd services are deployed:
 
 - **Plug AC** → switches to `performance` (only if currently on `balanced`)
 - **Unplug AC** → switches to `balanced` (only if currently on `performance`)
-- **Manual selections are never overridden** — if you chose `power-saver` or manually set `balanced` on AC, plug/unplug events won't change it
+- **Manual selections are never overridden** — if you chose `power-saver`, `boost`, or manually set `balanced` on AC, plug/unplug events won't change it
+
+Notifications show the power source: `performance (AC)`, `balanced (Battery)`, etc.
 
 The mechanism is:
 
