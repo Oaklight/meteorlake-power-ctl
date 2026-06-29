@@ -13,7 +13,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 import argparse
 import logging
@@ -152,14 +152,25 @@ def _color(text: str, code: int) -> str:
 def _get_desktop_user() -> tuple[str, str]:
     """Return (username, uid) of the real desktop user.
 
-    When running under sudo, returns the original user.
-    Otherwise falls back to the current user.
+    Priority: SUDO_USER/SUDO_UID env → scan /run/user/*/niri.*.sock
+    to find the graphical session owner. Handles systemd service context
+    where neither SUDO_USER nor a login shell exists.
     """
     user = os.environ.get("SUDO_USER")
     uid = os.environ.get("SUDO_UID")
     if user and uid:
         return user, uid
-    # Not under sudo — use current user
+    # Not under sudo — if we're root (e.g. systemd service), scan for
+    # the user who owns the niri session
+    if os.geteuid() == 0:
+        for sock in Path("/run/user").glob("*/niri.*.sock"):
+            uid = sock.parent.name  # e.g. "1000"
+            try:
+                user = pwd.getpwuid(int(uid)).pw_name
+                return user, uid
+            except (KeyError, ValueError):
+                continue
+    # Last resort: current process user
     pw = pwd.getpwuid(os.getuid())
     return pw.pw_name, str(pw.pw_uid)
 
