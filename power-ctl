@@ -13,7 +13,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 import argparse
 import logging
@@ -757,9 +757,11 @@ def cmd_install() -> None:
         [Unit]
         Description=power-ctl: restore performance on AC plug
         ConditionACPower=true
+        After=sleep.target
 
         [Service]
         Type=oneshot
+        ExecCondition=/bin/sh -c '! systemctl is-active --quiet sleep.target'
         ExecStart={script} on-ac
         """)
     )
@@ -767,9 +769,11 @@ def cmd_install() -> None:
         textwrap.dedent(f"""\
         [Unit]
         Description=power-ctl: switch to balanced on battery
+        After=sleep.target
 
         [Service]
         Type=oneshot
+        ExecCondition=/bin/sh -c '! systemctl is-active --quiet sleep.target'
         ExecStart={script} on-battery
         """)
     )
