@@ -10,11 +10,13 @@ LICENSE_DIR = $(DESTDIR)$(PREFIX)/share/licenses/mtl-power-ctl
 install:
 	install -Dm755 power-ctl $(BIN_DIR)/power-ctl
 	install -Dm644 config/90-mtl-power-ctl.conf $(CONF_DIR)/90-mtl-power-ctl.conf
+	install -Dm644 config/power-ctl.conf $(DESTDIR)/etc/power-ctl.conf
 	install -Dm644 LICENSE $(LICENSE_DIR)/LICENSE
 
 uninstall:
 	rm -f $(PREFIX)/bin/power-ctl
 	rm -f /etc/tlp.d/90-mtl-power-ctl.conf
+	rm -f /etc/power-ctl.conf
 	rm -rf $(PREFIX)/share/licenses/mtl-power-ctl
 
 help:

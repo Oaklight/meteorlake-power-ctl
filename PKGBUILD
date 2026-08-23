@@ -1,6 +1,6 @@
 # Maintainer: Pding <pding@oaklight.cn>
 pkgname=mtl-power-ctl
-pkgver=0.4.2
+pkgver=0.5.0
 pkgrel=1
 pkgdesc="Power profile manager for Intel Meteor Lake laptops (TLP + LPMD + SMT + P-core parking)"
 arch=('any')
@@ -12,8 +12,8 @@ optdepends=(
 	'niri: display refresh rate switching via IPC'
 )
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")
-sha256sums=('5c18a34ee3317dd7d152f8002ce8a0f8c156981c2ced24b351f1a7a0eba8e991')
-backup=('etc/tlp.d/90-mtl-power-ctl.conf')
+sha256sums=('2f19af17eeed1419fd1c2620afae746cb8b51bdad987963c703b8a27219be336')
+backup=('etc/tlp.d/90-mtl-power-ctl.conf' 'etc/power-ctl.conf')
 
 package() {
 	cd "meteorlake-power-ctl-${pkgver}"
