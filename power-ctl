@@ -13,7 +13,7 @@ Usage:
 
 from __future__ import annotations
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 import argparse
 import logging
@@ -35,6 +35,7 @@ LPMD_DIR = Path("/etc/intel_lpmd")
 LPMD_LIVE = LPMD_DIR / "intel_lpmd_config_F6_M170.xml"
 TLP_CONF_DEST = Path("/etc/tlp.d/90-mtl-power-ctl.conf")
 TLP_CONF_SRC = Path(__file__).resolve().parent / "config" / "90-mtl-power-ctl.conf"
+POWER_CTL_CONF = Path("/etc/power-ctl.conf")
 SMT_CONTROL = Path("/sys/devices/system/cpu/smt/control")
 SCRIPT_PATH = Path(__file__).resolve()
 
@@ -173,6 +174,25 @@ def _get_desktop_user() -> tuple[str, str]:
     # Last resort: current process user
     pw = pwd.getpwuid(os.getuid())
     return pw.pw_name, str(pw.pw_uid)
+
+
+def read_config() -> dict[str, str]:
+    """Parse /etc/power-ctl.conf (KEY=value lines, # comments)."""
+    conf: dict[str, str] = {}
+    try:
+        for line in POWER_CTL_CONF.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if "=" in line:
+                key, _, value = line.partition("=")
+                conf[key.strip()] = value.strip().strip("\"'")
+    except OSError:
+        pass
+    return conf
+
+
+def auto_ac_switch_enabled() -> bool:
+    """Whether to auto-switch to performance on AC plug (default: off)."""
+    return read_config().get("AUTO_AC_SWITCH", "0").lower() in ("1", "yes", "true")
 
 
 def is_ac_online() -> bool:
@@ -531,6 +551,39 @@ def apply_parking(profile: Profile) -> None:
         logger.info("Parked CPUs: %s", sorted(to_park))
 
 
+def _repin_xe_irq() -> None:
+    """Re-pin xe GPU IRQ to a regular E-core after CPU hotplug.
+
+    CPU hotplug (from parking/SMT changes) resets MSI IRQ affinity to kernel
+    defaults — LP E-cores whose deep C10 sleep (310µs latency) causes GPU
+    TLB invalidation fence timeouts and eventual system freeze.
+    """
+    target_cpu = 12  # first regular E-core, always online
+    irq = None
+    for line in Path("/proc/interrupts").read_text().splitlines():
+        if line.rstrip().endswith("xe"):
+            irq = line.split()[0].rstrip(":")
+            break
+    if not irq:
+        return
+    try:
+        mask = f"{1 << target_cpu:x}"
+        Path(f"/proc/irq/{irq}/smp_affinity").write_text(mask)
+    except OSError as e:
+        logger.warning("Failed to pin xe IRQ %s: %s", irq, e)
+        return
+    for st in sorted(
+        Path(f"/sys/devices/system/cpu/cpu{target_cpu}/cpuidle").glob("state[0-9]*")
+    ):
+        idx = int(st.name.removeprefix("state"))
+        if idx >= 2:
+            try:
+                (st / "disable").write_text("1")
+            except OSError:
+                pass
+    logger.info("Re-pinned xe IRQ %s to CPU %d", irq, target_cpu)
+
+
 def apply_profile(profile: Profile, *, notify_user: bool = True) -> None:
     """Apply all aspects of a power profile."""
     # Parking unparks all + enables SMT first, then parks selected cores
@@ -556,6 +609,7 @@ def apply_profile(profile: Profile, *, notify_user: bool = True) -> None:
                 pass
         logger.info("EPP overridden to %s", profile.epp_override)
     apply_lpmd(profile)
+    _repin_xe_irq()
     apply_refresh(profile)
     logger.info("Profile %s applied", profile.name)
     if notify_user:
@@ -568,6 +622,10 @@ def apply_profile(profile: Profile, *, notify_user: bool = True) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _requires_ac(profile_name: str) -> bool:
+    return profile_name in ("performance", "boost")
+
+
 def cmd_toggle(target: str | None = None) -> None:
     """Set a specific profile, or cycle if none given."""
     if target:
@@ -575,13 +633,20 @@ def cmd_toggle(target: str | None = None) -> None:
             print(f"Unknown profile: {target}", file=sys.stderr)
             print(f"Available: {', '.join(PROFILES)}", file=sys.stderr)
             sys.exit(1)
+        if _requires_ac(target) and not is_ac_online():
+            msg = f"{target} requires AC power"
+            notify("Power Profile", msg, "dialog-warning-symbolic")
+            print(f"Error: {msg}", file=sys.stderr)
+            sys.exit(1)
         apply_profile(PROFILES[target])
         return
 
     current = get_current_tlp_profile()
+    on_ac = is_ac_online()
+    cycle = CYCLE_ORDER if on_ac else [p for p in CYCLE_ORDER if not _requires_ac(p)]
     try:
-        idx = CYCLE_ORDER.index(current)
-        next_name = CYCLE_ORDER[(idx + 1) % len(CYCLE_ORDER)]
+        idx = cycle.index(current)
+        next_name = cycle[(idx + 1) % len(cycle)]
     except ValueError:
         next_name = "balanced"
 
@@ -591,28 +656,38 @@ def cmd_toggle(target: str | None = None) -> None:
 def cmd_on_ac() -> None:
     """Hook: called when AC power is connected.
 
-    Only auto-switch if currently on the default balanced (battery) profile.
-    Any manual selection (power-saver, boost, etc.) is preserved.
+    With AUTO_AC_SWITCH=1 in /etc/power-ctl.conf, switches balanced →
+    performance automatically. Otherwise just notifies and lets the user
+    pick via Mod+B.
     """
     if not is_ac_online():
         return
     current = get_current_tlp_profile()
-    if current == "balanced":
+    if current not in ("balanced", "power-saver"):
+        logger.info("Keeping manual profile %s on AC plug", current)
+        return
+
+    if auto_ac_switch_enabled():
         apply_profile(PROFILES["performance"])
     else:
-        logger.info("Keeping manual profile %s on AC plug", current)
+        notify(
+            "AC Connected",
+            "Mod+B to switch to performance",
+            PROFILES["performance"].icon,
+        )
+        logger.info("AC connected, staying on %s", current)
 
 
 def cmd_on_battery() -> None:
     """Hook: called when AC power is disconnected.
 
-    Only auto-switch if currently on the default performance (AC) profile.
-    Any manual selection (power-saver, boost, balanced) is preserved.
+    Auto-switch performance/boost → balanced (these profiles drain battery
+    too fast). Any manual selection (power-saver, balanced) is preserved.
     """
     if is_ac_online():
         return
     current = get_current_tlp_profile()
-    if current == "performance":
+    if current in ("performance", "boost"):
         apply_profile(PROFILES["balanced"])
     else:
         logger.info("Keeping manual profile %s on AC unplug", current)
@@ -703,10 +778,12 @@ def cmd_status() -> None:
     print(sep)
 
     source = _color("AC ⚡", 32) if ac else _color("Battery \U0001f50b", 33)
+    auto = _color("on", 32) if auto_ac_switch_enabled() else _color("off", 90)
     print(f"  Power:     {source}  {bat_pct}%  {bat_rate}")
     if bat_time:
         label = "remaining" if bat_status == "Discharging" else "to full"
         print(f"             {bat_time} {label}")
+    print(f"  AC switch: {auto}")
     print()
 
     print(f"  Platform:  {platform}")
@@ -733,6 +810,12 @@ def cmd_install() -> None:
     if TLP_CONF_SRC.is_file():
         shutil.copy2(TLP_CONF_SRC, TLP_CONF_DEST)
         print(f"  ✓ {TLP_CONF_DEST}")
+
+    # User config — never overwrite existing settings
+    conf_src = SCRIPT_PATH.parent / "config" / "power-ctl.conf"
+    if conf_src.is_file() and not POWER_CTL_CONF.exists():
+        shutil.copy2(conf_src, POWER_CTL_CONF)
+        print(f"  ✓ {POWER_CTL_CONF}")
 
     # Symlink
     system_bin = Path("/usr/local/bin/power-ctl")
